@@ -53,5 +53,5 @@ func CreateTable(typ interface{}, name string) string {
 		}
 	}
 
-	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %v (%v)`, name, strings.Join(fields, ",\n"))
+	return fmt.Sprintf(`create table if not exists %v (%v)`, name, strings.Join(fields, ",\n"))
 }

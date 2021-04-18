@@ -45,6 +45,9 @@ func Map(original []string, callback func(string, int) string) []string {
 
 func Tags(v interface{}, tag string) (res []string) {
 	t := reflect.TypeOf(v)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
@@ -85,4 +88,31 @@ func Reset(val interface{}) error {
 		}
 	}
 	return nil
+}
+
+func StructMap(v interface{}) (Table, error) {
+	t := reflect.TypeOf(v)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil, NotAStruct
+	}
+	res := Table{}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		name := field.Name
+		res[name] = Field{
+			JSON: strings.Split(field.Tag.Get("json"), ",")[0],
+			DB:   field.Tag.Get("db"),
+		}
+	}
+	return res, nil
+}
+
+type Table map[string]Field
+
+type Field struct {
+	JSON string `json:"json,omitempty"`
+	DB   string `json:"db,omitempty"`
 }
