@@ -19,35 +19,40 @@ const (
 
 //Migrate creates analyzes two structs of the same type and will return various sql statements to migrate from old to new.
 //If old is nil it returns sql for a new table.
-func Migrate(oldMap Table, new interface{}, tableName string) (res []string, err error) {
+//If passed true in the last argument `safe`, it will not return drop column statements.
+func Migrate(oldMap Table, new interface{}, tableName string, safe bool) (res []string, newMap Table, err error) {
 	if oldMap == nil {
-		return []string{CreateTable(new, tableName)}, nil
+		return []string{CreateTable(new, tableName)}, nil, nil
 	}
-	newMap, err := StructMap(new)
+	newMap, err = StructMap(new)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	queries := []string{}
 	for key, oldval := range oldMap {
 		newval, ok := newMap[key]
 		switch {
 		case !ok:
-			//doesnt exist in old
-			queries = append(queries, fmt.Sprintf("alter table %v drop column %q", tableName, oldval.JSON))
+			//doesnt exist in new
+			if !safe {
+				queries = append(queries, fmt.Sprintf("alter table %v drop column %q", tableName, oldval.JSON))
+			}
 		case ok:
 			//exists in both
-			if oldval.JSON != newval.JSON {
+			if oldval.JSON != newval.JSON { // name changed
+
 				oldIsField, _ := isField(oldval.DB)
 				newIsField, _ := isField(newval.DB)
 				if oldIsField && newIsField {
+					//rename
 					queries = append(queries, fmt.Sprintf("alter table %v rename column %q to %q", tableName, oldval.JSON, newval.JSON))
 				}
 			}
 			if oldval.DB != newval.DB {
 				// fmt.Println("parsing db changes for", key)
-				qs, err := parseMigration(tableName, newval.JSON, oldval.DB, newval.DB)
+				qs, err := parseMigration(tableName, newval.JSON, oldval.DB, newval.DB, safe)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				queries = append(queries, qs...)
 			}
@@ -61,18 +66,21 @@ func Migrate(oldMap Table, new interface{}, tableName string) (res []string, err
 			}
 		}
 	}
-	return queries, nil
+	return queries, newMap, nil
 }
 
 type MigrateType int
 
-func parseMigration(table, name, old, new string) ([]string, error) {
+func parseMigration(table, name, old, new string, safe bool) ([]string, error) {
 	oldIsField, oldField := isField(old)
 	newIsField, newField := isField(new)
 	// fmt.Printf("\told %q new %q\n", old, new)
 	if oldIsField && !newIsField {
 		//delete column
-		return []string{fmt.Sprintf("alter table %v drop column %q", table, name)}, nil
+		if !safe {
+			return []string{fmt.Sprintf("alter table %v drop column %q", table, name)}, nil
+		}
+		return nil, nil
 	}
 	if !oldIsField && newIsField {
 		fmt.Printf("\tadd column %q %v\n", name, newField)
@@ -88,7 +96,7 @@ func parseMigration(table, name, old, new string) ([]string, error) {
 	return nil, nil
 }
 
-var migrationTokens = map[string]func(string, string, []string, MigrateType) ([]string, error){
+var migrationTokens = map[string]func(string, string, []string, []string, MigrateType) ([]string, error){
 	"primary key": parsePrimaryKey,
 	"unique":      parseUnique,
 	"not null":    parseNotNull,
@@ -102,7 +110,7 @@ func parseChanges(table, name, old, new string) ([]string, error) {
 	oldType := getType(old)
 	newType := getType(new)
 	if oldType != newType {
-		sql := fmt.Sprintf("type %v using %v::%v", newType, name, newType)
+		sql := fmt.Sprintf("alter table %v alter column %v type %v using %v::%v", table, name, newType, name, newType)
 		statements = append(statements, sql)
 	}
 	oldTokens := strings.Split(old, " ")
@@ -116,7 +124,7 @@ func parseChanges(table, name, old, new string) ([]string, error) {
 		}
 		if oldToken == -1 && newToken > -1 {
 			//it has been added or modified so create it
-			res, err := fn(table, name, newTokens, Add)
+			res, err := fn(table, name, oldTokens, newTokens, Add)
 			if err != nil {
 				return nil, err
 			}
@@ -125,7 +133,7 @@ func parseChanges(table, name, old, new string) ([]string, error) {
 		}
 		if oldToken > -1 && newToken == -1 {
 			//it has been removed so drop it
-			res, err := fn(table, name, oldTokens, Remove)
+			res, err := fn(table, name, oldTokens, newTokens, Remove)
 			if err != nil {
 				return nil, err
 			}
@@ -134,7 +142,7 @@ func parseChanges(table, name, old, new string) ([]string, error) {
 		}
 		if oldToken > -1 && newToken > -1 {
 			//both have it, check if it's different
-			res, err := fn(table, name, newTokens, Update)
+			res, err := fn(table, name, oldTokens, newTokens, Update)
 			if err != nil {
 				return nil, err
 			}
@@ -148,14 +156,8 @@ func parseChanges(table, name, old, new string) ([]string, error) {
 }
 
 func getType(s string) string {
-	r := strings.Split(s, "field:")
-	if len(r) > 1 {
-		t := strings.Split(r[1], " ")
-		return t[0]
-	}
-	return ""
+	return strings.Split(s, " ")[0]
 }
-
 func isField(s string) (bool, string) {
 	if ok := strings.Contains(s, "field:"); ok {
 		if split := strings.Split(s, "field:"); len(split) > 1 {
@@ -165,7 +167,7 @@ func isField(s string) (bool, string) {
 	return false, ""
 }
 
-func parsePrimaryKey(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+func parsePrimaryKey(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	switch typ {
 	case Add:
 		return []string{fmt.Sprintf("alter table %v add primary key (%q)", table, name)}, nil
@@ -174,7 +176,7 @@ func parsePrimaryKey(table, name string, tokens []string, typ MigrateType) ([]st
 	}
 	return nil, nil
 }
-func parseNotNull(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+func parseNotNull(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	switch typ {
 	case Add:
 		return []string{fmt.Sprintf(`alter table %v alter column %q set not null`, table, name)}, nil
@@ -183,11 +185,11 @@ func parseNotNull(table, name string, tokens []string, typ MigrateType) ([]strin
 	}
 	return nil, nil
 }
-func parseDefault(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+func parseDefault(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	switch typ {
 	case Add, Update:
 		var df string
-		for _, token := range tokens {
+		for _, token := range newTokens {
 			if strings.Contains(token, "default") {
 				split := strings.Split(token, "default(")
 				if len(split) > 1 {
@@ -216,22 +218,42 @@ var referenceActions = map[string]struct{}{
 	"default":   empty,
 }
 
-func parseReferences(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+func parseReferences(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	//structure is = references <ident>(<ident>) <referenceToken> <referenceAction> <referenceToken> <referenceAction>
 	res := []string{}
 
 	if typ == Remove || typ == Update {
 		res = append(res, fmt.Sprintf("alter table %v drop constraint if exists %v_%v_fk", table, table, name))
 	}
+	oldfield, oldreference, oldDel, oldUpd, err := parseReferenceTokens(table, name, oldTokens)
+	if err != nil {
+		return nil, err
+	}
+	field, reference, delAction, updAction, err := parseReferenceTokens(table, name, newTokens)
+	if err != nil {
+		return nil, err
+	}
+	if field == oldfield && reference == oldreference && oldDel == delAction && oldUpd == updAction {
+		return nil, nil
+	}
+
+	if field == "" || reference == "" {
+		return nil, fmt.Errorf("missing reference field or reference for %q column %q", table, name)
+	}
+
+	res = append(res, fmt.Sprintf("alter table %v add constraint %v_%v_fk foreign key (%q) references %v (%q) on update %v on delete %v", table, table, name, name, reference, field, updAction, delAction))
+	// fmt.Sprintf("references %v(%v)  %v", val, "id", "on delete cascade on update cascade")
+	return res, nil
+}
+
+func parseReferenceTokens(table, name string, tokens []string) (field string, reference string, delAction string, updAction string, err error) {
 	ident := false
 	del := false
 	upd := false
 	on := false
 	set := false
-	var field string
-	var reference string
-	var delAction string = "no action"
-	var updAction string = "no action"
+	delAction = "no action"
+	updAction = "no action"
 	for _, token := range tokens {
 		if ident {
 			s := strings.SplitN(token, "(", 2)
@@ -270,13 +292,13 @@ func parseReferences(table, name string, tokens []string, typ MigrateType) ([]st
 					continue
 				}
 				if token != "null" && token != "default" {
-					return nil, fmt.Errorf("syntax error at migration for %q column %q. Expecting on delete set null or set default, got set %v", table, name, token)
+					return "", "", "", "", fmt.Errorf("syntax error at migration for %q column %q. Expecting on delete set null or set default, got set %v", table, name, token)
 				}
 				delAction = "set " + token
 				del = false
 				continue
 			}
-			return nil, fmt.Errorf("syntax error at migration for %q column %q. Unknown 'on delete' action: got %v, expected one of (cascade, set null, set default, no action, restrict) ", table, name, token)
+			return "", "", "", "", fmt.Errorf("syntax error at migration for %q column %q. Unknown 'on delete' action: got %v, expected one of (cascade, set null, set default, no action, restrict) ", table, name, token)
 		}
 		if upd {
 			if _, ok := referenceActions[token]; ok {
@@ -290,13 +312,13 @@ func parseReferences(table, name string, tokens []string, typ MigrateType) ([]st
 					continue
 				}
 				if token != "null" && token != "default" {
-					return nil, fmt.Errorf("syntax error at migration for %q column %q. Expecting on update set null or set default, got set %v", table, name, token)
+					return "", "", "", "", fmt.Errorf("syntax error at migration for %q column %q. Expecting on update set null or set default, got set %v", table, name, token)
 				}
 				updAction = "set " + token
 				upd = false
 				continue
 			}
-			return nil, fmt.Errorf("syntax error at migration for %q column %q. Unknown 'on update' action: got %v, expected one of (cascade, set null, set default, no action, restrict) ", table, name, token)
+			return "", "", "", "", fmt.Errorf("syntax error at migration for %q column %q. Unknown 'on update' action: got %v, expected one of (cascade, set null, set default, no action, restrict) ", table, name, token)
 		}
 		switch token {
 		case "references":
@@ -308,20 +330,16 @@ func parseReferences(table, name string, tokens []string, typ MigrateType) ([]st
 			break
 		}
 	}
-	if field != "" && reference != "" && typ != Remove {
-		res = append(res, fmt.Sprintf("alter table %v add constraint %v_%v_fk foreign key (%q) references %v (%q) on update %v on delete %v", table, table, name, name, reference, field, updAction, delAction))
-	}
-
-	// fmt.Sprintf("references %v(%v)  %v", val, "id", "on delete cascade on update cascade")
-	return res, nil
+	return field, reference, delAction, updAction, nil
 }
-func parseCheck(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+
+func parseCheck(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	res := []string{}
 	if typ == Remove || typ == Update {
 		res = append(res, fmt.Sprintf("alter table %v drop constraint if exists %v_%v_check", table, table, name))
 	}
 	if typ == Update || typ == Add {
-		str := strings.Join(tokens, " ")
+		str := strings.Join(newTokens, " ")
 		start := strings.Index(str, "check(")
 		if start > -1 {
 			var end int
@@ -350,12 +368,19 @@ func parseCheck(table, name string, tokens []string, typ MigrateType) ([]string,
 
 	return res, nil
 }
-func parseUnique(table, name string, tokens []string, typ MigrateType) ([]string, error) {
+func parseUnique(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
+	res := []string{}
+	if typ == Remove || typ == Update {
+		res = append(res, fmt.Sprintf(`alter table %v drop constraint if exists %v_%v_key`, table, table, name))
+	}
+	if typ == Add || typ == Update {
+		res = append(res, fmt.Sprintf(`alter table %v add constraint %v_%v_key unique (%v)`, table, table, name, name))
+	}
 	//ALTER TABLE public.users DROP CONSTRAINT users_email_key;
 
 	// ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)
 
-	return nil, nil
+	return res, nil
 }
 
 /*
