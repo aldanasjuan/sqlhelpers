@@ -12,7 +12,7 @@ func main() {
 	start := time.Now()
 	f, _ := sqlhelpers.StructMap(User{})
 	_ = f
-	res, newMap, err := sqlhelpers.Migrate(f, User2{}, "users", false)
+	res, newMap, err := sqlhelpers.Migrate(&f, User2{}, "users", false)
 	if err != nil {
 		fmt.Println("error", err)
 	}

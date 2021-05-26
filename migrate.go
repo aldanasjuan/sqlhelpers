@@ -17,13 +17,19 @@ const (
 	Update
 )
 
-//Migrate creates analyzes two structs of the same type and will return various sql statements to migrate from old to new.
-//If old is nil it returns sql for a new table.
+//Migrate analyzes two structs of the same type and will return various sql statements to migrate a db table from old to new.
+//If old is nil it returns sql to create a new table based on it.
 //If passed true in the last argument `safe`, it will not return drop column statements.
-func Migrate(oldMap Table, new interface{}, tableName string, safe bool) (res []string, newMap Table, err error) {
-	if oldMap == nil {
-		return []string{CreateTable(new, tableName)}, nil, nil
+func Migrate(old *Table, new interface{}, tableName string, safe bool) (res []string, newMap Table, err error) {
+	newMap, err = StructMap(new)
+	if err != nil {
+		return nil, nil, err
 	}
+
+	if old == nil {
+		return []string{CreateTable(new, tableName)}, newMap, nil
+	}
+	oldMap := *old
 	newMap, err = StructMap(new)
 	if err != nil {
 		return nil, nil, err
@@ -34,7 +40,8 @@ func Migrate(oldMap Table, new interface{}, tableName string, safe bool) (res []
 		switch {
 		case !ok:
 			//doesnt exist in new
-			if !safe {
+			oldIsField, _ := isField(oldval.DB)
+			if !safe && oldIsField {
 				queries = append(queries, fmt.Sprintf("alter table %v drop column %q", tableName, oldval.JSON))
 			}
 		case ok:
@@ -188,19 +195,30 @@ func parseNotNull(table, name string, oldTokens, newTokens []string, typ Migrate
 func parseDefault(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	switch typ {
 	case Add, Update:
-		var df string
+		var newDefault string
+		var oldDefault string
 		for _, token := range newTokens {
 			if strings.Contains(token, "default") {
 				split := strings.Split(token, "default(")
 				if len(split) > 1 {
 					s := split[1]
-					df = s[0 : len(s)-1]
+					newDefault = s[0 : len(s)-1]
 				}
 				break
 			}
 		}
-		if df != "" {
-			return []string{fmt.Sprintf(`alter table %v alter column %q set default %v`, table, name, df)}, nil
+		for _, token := range oldTokens {
+			if strings.Contains(token, "default") {
+				split := strings.Split(token, "default(")
+				if len(split) > 1 {
+					s := split[1]
+					oldDefault = s[0 : len(s)-1]
+				}
+				break
+			}
+		}
+		if newDefault != "" && oldDefault != newDefault {
+			return []string{fmt.Sprintf(`alter table %v alter column %q set default %v`, table, name, newDefault)}, nil
 		}
 		return nil, nil
 	case Remove:
@@ -339,34 +357,42 @@ func parseCheck(table, name string, oldTokens, newTokens []string, typ MigrateTy
 		res = append(res, fmt.Sprintf("alter table %v drop constraint if exists %v_%v_check", table, table, name))
 	}
 	if typ == Update || typ == Add {
-		str := strings.Join(newTokens, " ")
-		start := strings.Index(str, "check(")
-		if start > -1 {
-			var end int
-			openpar := 0
-		loop:
-			for i := start; i < len(str); i++ {
-				b := str[i]
-				switch b {
-				case '(':
-					openpar++
-				case ')':
-					if openpar < 2 {
-						end = i
-						break loop
-					}
-					openpar--
-				}
-			}
-			if start < end && end < len(str) {
-				check := str[start : end+1]
-				// fmt.Println(check)
-				res = append(res, fmt.Sprintf("alter table %v add constraint %v_%v_check %v", table, table, name, check))
-			}
+		oldCheck := parseCheckValue(oldTokens)
+		newCheck := parseCheckValue(newTokens)
+		if oldCheck == newCheck {
+			return nil, nil
 		}
+		res = append(res, fmt.Sprintf("alter table %v add constraint %v_%v_check %v", table, table, name, newCheck))
 	}
 
 	return res, nil
+}
+func parseCheckValue(tokens []string) string {
+	str := strings.Join(tokens, " ")
+	start := strings.Index(str, "check(")
+	if start > -1 {
+		var end int
+		openpar := 0
+	loop:
+		for i := start; i < len(str); i++ {
+			b := str[i]
+			switch b {
+			case '(':
+				openpar++
+			case ')':
+				if openpar < 2 {
+					end = i
+					break loop
+				}
+				openpar--
+			}
+		}
+		if start < end && end < len(str) {
+			check := str[start : end+1]
+			return check
+		}
+	}
+	return ""
 }
 func parseUnique(table, name string, oldTokens, newTokens []string, typ MigrateType) ([]string, error) {
 	res := []string{}
